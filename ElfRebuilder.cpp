@@ -513,21 +513,31 @@ bool ElfRebuilder::RebuildShdr() {
                     Elf_Addr max_fde_vaddr =
                         eh_phdr->p_vaddr + (int64_t)max_fde_off;
 
-                    uint32_t fde_len32;
-                    memcpy(&fde_len32, base + max_fde_vaddr, 4);
-                    Elf_Addr fde_end;
-                    if (fde_len32 == 0xffffffff) {
-                        uint64_t fde_len64;
-                        memcpy(&fde_len64, base + max_fde_vaddr + 4, 8);
-                        fde_end = max_fde_vaddr + 12 + fde_len64;
-                    } else {
-                        fde_end = max_fde_vaddr + 4 + fde_len32;
-                    }
-                    if (fde_end > eh_frame_vaddr &&
-                        fde_end <= si.max_load)
+                    // Bounds-check max_fde_vaddr before dereferencing.
+                    // Untrusted: dump bytes can be partially corrupted (yidun
+                    // anti-tamper rewrites RX pages on detection), and the
+                    // table walk above scans whatever fde_count says is there.
+                    // Need room for the largest read we'll do: 12 bytes
+                    // (length=0xffffffff sentinel + 8-byte extended length).
+                    if (max_fde_vaddr >= si.min_load &&
+                        max_fde_vaddr + 12 <= si.max_load)
                     {
-                        eh_frame_size = fde_end - eh_frame_vaddr;
-                        size_known = true;
+                        uint32_t fde_len32;
+                        memcpy(&fde_len32, base + max_fde_vaddr, 4);
+                        Elf_Addr fde_end;
+                        if (fde_len32 == 0xffffffff) {
+                            uint64_t fde_len64;
+                            memcpy(&fde_len64, base + max_fde_vaddr + 4, 8);
+                            fde_end = max_fde_vaddr + 12 + fde_len64;
+                        } else {
+                            fde_end = max_fde_vaddr + 4 + fde_len32;
+                        }
+                        if (fde_end > eh_frame_vaddr &&
+                            fde_end <= si.max_load)
+                        {
+                            eh_frame_size = fde_end - eh_frame_vaddr;
+                            size_known = true;
+                        }
                     }
                 }
 
