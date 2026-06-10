@@ -126,6 +126,8 @@ private:
     Elf_Word sGOT = 0;
     Elf_Word sDATA = 0;
     Elf_Word sBSS = 0;
+    Elf_Word sEHFRAMEHDR = 0;
+    Elf_Word sEHFRAME = 0;
     Elf_Word sSHSTRTAB = 0;
 
     std::vector<Elf_Shdr> shdrs;

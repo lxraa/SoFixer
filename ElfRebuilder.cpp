@@ -6,6 +6,8 @@
 //
 //===----------------------------------------------------------------------===//
 #include <cstdio>
+#include <cstring>
+#include <cstdint>
 #include "ElfRebuilder.h"
 #include "elf.h"
 #include "FDebug.h"
@@ -434,6 +436,131 @@ bool ElfRebuilder::RebuildShdr() {
 //        shdrs.push_back(shdr);
 //    }
 
+    // gen .eh_frame_hdr and .eh_frame from PT_GNU_EH_FRAME.
+    // Packed libil2cpp.so (yidun/tp/mihoyo) wipes ELF header but leaves PHT
+    // intact; PT_GNU_EH_FRAME survives because the runtime needs it for C++
+    // unwind. Promoting them to section headers lets Ghidra/IDA use unwind
+    // tables for function boundary detection on the dumped binary.
+    {
+        auto eh_phdr_table = (const Elf_Phdr*)elf_reader_->loaded_phdr();
+        const Elf_Phdr* eh_phdr = nullptr;
+        for (auto i = 0; i < elf_reader_->phdr_count(); i++) {
+            if (eh_phdr_table[i].p_type == PT_GNU_EH_FRAME) {
+                eh_phdr = &eh_phdr_table[i];
+                break;
+            }
+        }
+
+        if (eh_phdr != nullptr && eh_phdr->p_memsz >= 12) {
+            // gen .eh_frame_hdr (always — straight copy of PT segment bounds)
+            sEHFRAMEHDR = shdrs.size();
+
+            Elf_Shdr shdr;
+            shdr.sh_name = shstrtab.length();
+            shstrtab.append(".eh_frame_hdr");
+            shstrtab.push_back('\0');
+
+            shdr.sh_type = SHT_PROGBITS;
+            shdr.sh_flags = SHF_ALLOC;
+            shdr.sh_addr = eh_phdr->p_vaddr;
+            shdr.sh_offset = shdr.sh_addr;
+            shdr.sh_size = eh_phdr->p_memsz;
+            shdr.sh_link = 0;
+            shdr.sh_info = 0;
+            shdr.sh_addralign = 4;
+            shdr.sh_entsize = 0;
+            shdrs.push_back(shdr);
+
+            // Decode .eh_frame_hdr header to locate and size .eh_frame.
+            // Standard GCC/Clang Android NDK layout:
+            //   byte 0 = version (1)
+            //   byte 1 = eh_frame_ptr_enc (expect 0x1b: DW_EH_PE_pcrel|sdata4)
+            //   byte 2 = fde_count_enc    (expect 0x03: DW_EH_PE_udata4)
+            //   byte 3 = table_enc        (expect 0x3b: DW_EH_PE_datarel|sdata4)
+            //   bytes 4..7  = eh_frame_ptr (s32, pcrel from byte 4)
+            //   bytes 8..11 = fde_count (u32)
+            //   bytes 12..  = pairs of (initial_loc s32, fde_off s32),
+            //                 both datarel from .eh_frame_hdr start.
+            // Unsupported encodings fall back to emitting .eh_frame_hdr only;
+            // Ghidra can still consume PT_GNU_EH_FRAME directly in that case.
+            auto* hdr_bytes = (const uint8_t*)(base + eh_phdr->p_vaddr);
+            if (hdr_bytes[0] == 1 &&
+                hdr_bytes[1] == 0x1b &&
+                hdr_bytes[2] == 0x03 &&
+                hdr_bytes[3] == 0x3b)
+            {
+                int32_t eh_frame_off;
+                uint32_t fde_count;
+                memcpy(&eh_frame_off, hdr_bytes + 4, 4);
+                memcpy(&fde_count, hdr_bytes + 8, 4);
+
+                Elf_Addr eh_frame_vaddr =
+                    eh_phdr->p_vaddr + 4 + (int64_t)eh_frame_off;
+
+                bool size_known = false;
+                size_t eh_frame_size = 0;
+                size_t table_bytes = (size_t)fde_count * 8;
+                if (fde_count > 0 &&
+                    eh_phdr->p_memsz >= 12 + table_bytes)
+                {
+                    int32_t max_fde_off = INT32_MIN;
+                    auto* tbl = hdr_bytes + 12;
+                    for (uint32_t i = 0; i < fde_count; i++) {
+                        int32_t fde_off;
+                        memcpy(&fde_off, tbl + i * 8 + 4, 4);
+                        if (fde_off > max_fde_off) max_fde_off = fde_off;
+                    }
+                    Elf_Addr max_fde_vaddr =
+                        eh_phdr->p_vaddr + (int64_t)max_fde_off;
+
+                    uint32_t fde_len32;
+                    memcpy(&fde_len32, base + max_fde_vaddr, 4);
+                    Elf_Addr fde_end;
+                    if (fde_len32 == 0xffffffff) {
+                        uint64_t fde_len64;
+                        memcpy(&fde_len64, base + max_fde_vaddr + 4, 8);
+                        fde_end = max_fde_vaddr + 12 + fde_len64;
+                    } else {
+                        fde_end = max_fde_vaddr + 4 + fde_len32;
+                    }
+                    if (fde_end > eh_frame_vaddr &&
+                        fde_end <= si.max_load)
+                    {
+                        eh_frame_size = fde_end - eh_frame_vaddr;
+                        size_known = true;
+                    }
+                }
+
+                sEHFRAME = shdrs.size();
+
+                Elf_Shdr ef_shdr;
+                ef_shdr.sh_name = shstrtab.length();
+                shstrtab.append(".eh_frame");
+                shstrtab.push_back('\0');
+
+                ef_shdr.sh_type = SHT_PROGBITS;
+                ef_shdr.sh_flags = SHF_ALLOC;
+                ef_shdr.sh_addr = eh_frame_vaddr;
+                ef_shdr.sh_offset = ef_shdr.sh_addr;
+                // If size_known, use it. Otherwise upper-bound to load end;
+                // the post-sort fix-size pass will clamp to the next section.
+                ef_shdr.sh_size = size_known ?
+                    eh_frame_size :
+                    (si.max_load - eh_frame_vaddr);
+                ef_shdr.sh_link = 0;
+                ef_shdr.sh_info = 0;
+                ef_shdr.sh_addralign = 8;
+                ef_shdr.sh_entsize = 0;
+                shdrs.push_back(ef_shdr);
+            } else {
+                FLOGD("eh_frame_hdr uses non-default encoding "
+                      "(ver=%d ptr=0x%x fde=0x%x tbl=0x%x); "
+                      "only .eh_frame_hdr emitted",
+                      hdr_bytes[0], hdr_bytes[1], hdr_bytes[2], hdr_bytes[3]);
+            }
+        }
+    }
+
     // gen .shstrtab, pad into last data
     if(true) {
         sSHSTRTAB = shdrs.size();
@@ -490,6 +617,8 @@ bool ElfRebuilder::RebuildShdr() {
                 chgIdx(sGOT);
                 chgIdx(sDATA);
                 chgIdx(sBSS);
+                chgIdx(sEHFRAMEHDR);
+                chgIdx(sEHFRAME);
                 chgIdx(sSHSTRTAB);
             }
         }
