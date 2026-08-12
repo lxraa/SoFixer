@@ -451,7 +451,24 @@ bool ElfRebuilder::RebuildShdr() {
             }
         }
 
-        if (eh_phdr != nullptr && eh_phdr->p_memsz >= 12) {
+        // The segment bounds come from the dump and are untrusted: a packer can
+        // leave a fabricated or stale PT_GNU_EH_FRAME behind. Require the whole
+        // segment to describe bytes we actually hold before reading any of it —
+        // p_memsz is also the only bound on the FDE table walk further down.
+        // Written as a subtraction so it cannot wrap on the 32-bit build.
+        bool eh_within_image = eh_phdr != nullptr &&
+                               eh_phdr->p_memsz >= 12 &&
+                               eh_phdr->p_vaddr >= si.min_load &&
+                               eh_phdr->p_vaddr <= si.max_load &&
+                               eh_phdr->p_memsz <= si.max_load - eh_phdr->p_vaddr;
+        if (eh_phdr != nullptr && !eh_within_image) {
+            FLOGD("PT_GNU_EH_FRAME [%" ADDRESS_FORMAT "x, +%" ADDRESS_FORMAT "x) "
+                  "unusable against loaded image [%" ADDRESS_FORMAT "x, %" ADDRESS_FORMAT "x); "
+                  "no unwind sections emitted",
+                  eh_phdr->p_vaddr, eh_phdr->p_memsz, si.min_load, si.max_load);
+        }
+
+        if (eh_within_image) {
             // gen .eh_frame_hdr (always — straight copy of PT segment bounds)
             sEHFRAMEHDR = shdrs.size();
 
@@ -496,6 +513,14 @@ bool ElfRebuilder::RebuildShdr() {
 
                 Elf_Addr eh_frame_vaddr =
                     eh_phdr->p_vaddr + 4 + (int64_t)eh_frame_off;
+                bool eh_frame_within_image =
+                    eh_frame_vaddr >= si.min_load && eh_frame_vaddr < si.max_load;
+                if (!eh_frame_within_image) {
+                    FLOGD("eh_frame_ptr resolves to %" ADDRESS_FORMAT "x, outside "
+                          "loaded image [%" ADDRESS_FORMAT "x, %" ADDRESS_FORMAT "x); "
+                          "only .eh_frame_hdr emitted",
+                          eh_frame_vaddr, si.min_load, si.max_load);
+                }
 
                 bool size_known = false;
                 size_t eh_frame_size = 0;
@@ -541,27 +566,32 @@ bool ElfRebuilder::RebuildShdr() {
                     }
                 }
 
-                sEHFRAME = shdrs.size();
+                // eh_frame_ptr is untrusted too. A vaddr outside the image
+                // makes the fallback size below underflow, and such a section
+                // sorts last, where the fix-size pass can no longer clamp it.
+                if (eh_frame_within_image) {
+                    sEHFRAME = shdrs.size();
 
-                Elf_Shdr ef_shdr;
-                ef_shdr.sh_name = shstrtab.length();
-                shstrtab.append(".eh_frame");
-                shstrtab.push_back('\0');
+                    Elf_Shdr ef_shdr;
+                    ef_shdr.sh_name = shstrtab.length();
+                    shstrtab.append(".eh_frame");
+                    shstrtab.push_back('\0');
 
-                ef_shdr.sh_type = SHT_PROGBITS;
-                ef_shdr.sh_flags = SHF_ALLOC;
-                ef_shdr.sh_addr = eh_frame_vaddr;
-                ef_shdr.sh_offset = ef_shdr.sh_addr;
-                // If size_known, use it. Otherwise upper-bound to load end;
-                // the post-sort fix-size pass will clamp to the next section.
-                ef_shdr.sh_size = size_known ?
-                    eh_frame_size :
-                    (si.max_load - eh_frame_vaddr);
-                ef_shdr.sh_link = 0;
-                ef_shdr.sh_info = 0;
-                ef_shdr.sh_addralign = 8;
-                ef_shdr.sh_entsize = 0;
-                shdrs.push_back(ef_shdr);
+                    ef_shdr.sh_type = SHT_PROGBITS;
+                    ef_shdr.sh_flags = SHF_ALLOC;
+                    ef_shdr.sh_addr = eh_frame_vaddr;
+                    ef_shdr.sh_offset = ef_shdr.sh_addr;
+                    // If size_known, use it. Otherwise upper-bound to load end;
+                    // the post-sort fix-size pass will clamp to the next section.
+                    ef_shdr.sh_size = size_known ?
+                        eh_frame_size :
+                        (si.max_load - eh_frame_vaddr);
+                    ef_shdr.sh_link = 0;
+                    ef_shdr.sh_info = 0;
+                    ef_shdr.sh_addralign = 8;
+                    ef_shdr.sh_entsize = 0;
+                    shdrs.push_back(ef_shdr);
+                }
             } else {
                 FLOGD("eh_frame_hdr uses non-default encoding "
                       "(ver=%d ptr=0x%x fde=0x%x tbl=0x%x); "

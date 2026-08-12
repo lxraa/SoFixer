@@ -8,6 +8,14 @@ cmake -DSO_64=ON ..
 make
 ```
 
+## 测试
+`tests/` 覆盖 PT_GNU_EH_FRAME → section header 的重建。测试直接跑 `build/SoFixer64.exe`，
+用 `tests/elf_fixture.py` 现造最小 ELF，并伪造 dump 里会被篡改/损坏的那几个字段。
+
+```shell
+python -m pytest tests -v
+```
+
 ## 使用方法
 * 從so中dump內存， ida腳本
 ```$cpp
