@@ -488,28 +488,24 @@ bool ElfRebuilder::RebuildShdr() {
             shdr.sh_entsize = 0;
             shdrs.push_back(shdr);
 
-            // Decode .eh_frame_hdr header to locate and size .eh_frame.
-            // Standard GCC/Clang Android NDK layout:
+            // Decode .eh_frame_hdr to locate .eh_frame. Standard GCC/Clang
+            // Android NDK layout:
             //   byte 0 = version (1)
             //   byte 1 = eh_frame_ptr_enc (expect 0x1b: DW_EH_PE_pcrel|sdata4)
-            //   byte 2 = fde_count_enc    (expect 0x03: DW_EH_PE_udata4)
-            //   byte 3 = table_enc        (expect 0x3b: DW_EH_PE_datarel|sdata4)
+            //   byte 2 = fde_count_enc
+            //   byte 3 = table_enc
             //   bytes 4..7  = eh_frame_ptr (s32, pcrel from byte 4)
-            //   bytes 8..11 = fde_count (u32)
-            //   bytes 12..  = pairs of (initial_loc s32, fde_off s32),
-            //                 both datarel from .eh_frame_hdr start.
-            // Unsupported encodings fall back to emitting .eh_frame_hdr only;
-            // Ghidra can still consume PT_GNU_EH_FRAME directly in that case.
+            //   bytes 8..11 = fde_count, then the binary search table.
+            // Only the first two are read. The search table is optional
+            // (DW_EH_PE_omit), its entries are untrusted, and .eh_frame is
+            // self-describing, so the size comes from walking it instead.
+            // An unsupported eh_frame_ptr encoding falls back to emitting
+            // .eh_frame_hdr only; Ghidra can still consume PT_GNU_EH_FRAME
+            // directly in that case.
             auto* hdr_bytes = (const uint8_t*)(base + eh_phdr->p_vaddr);
-            if (hdr_bytes[0] == 1 &&
-                hdr_bytes[1] == 0x1b &&
-                hdr_bytes[2] == 0x03 &&
-                hdr_bytes[3] == 0x3b)
-            {
+            if (hdr_bytes[0] == 1 && hdr_bytes[1] == 0x1b) {
                 int32_t eh_frame_off;
-                uint32_t fde_count;
                 memcpy(&eh_frame_off, hdr_bytes + 4, 4);
-                memcpy(&fde_count, hdr_bytes + 8, 4);
 
                 Elf_Addr eh_frame_vaddr =
                     eh_phdr->p_vaddr + 4 + (int64_t)eh_frame_off;
@@ -522,47 +518,40 @@ bool ElfRebuilder::RebuildShdr() {
                           eh_frame_vaddr, si.min_load, si.max_load);
                 }
 
+                // Size .eh_frame by walking its record chain. Every record is
+                // a u32 length followed by that many bytes; 0xffffffff means
+                // the real length is the u64 that follows; a zero length is
+                // the terminator, and those 4 bytes belong to the section.
+                //
+                // Every bound is a subtraction against max_load rather than an
+                // addition compared to it, so a forged length cannot wrap into
+                // range - on the 32-bit build Elf_Addr is only 32 bits wide.
+                // The cursor advances by at least 4 per iteration, so a corrupt
+                // chain terminates rather than spinning.
                 bool size_known = false;
                 size_t eh_frame_size = 0;
-                size_t table_bytes = (size_t)fde_count * 8;
-                if (fde_count > 0 &&
-                    eh_phdr->p_memsz >= 12 + table_bytes)
-                {
-                    int32_t max_fde_off = INT32_MIN;
-                    auto* tbl = hdr_bytes + 12;
-                    for (uint32_t i = 0; i < fde_count; i++) {
-                        int32_t fde_off;
-                        memcpy(&fde_off, tbl + i * 8 + 4, 4);
-                        if (fde_off > max_fde_off) max_fde_off = fde_off;
+                if (eh_frame_within_image) {
+                    Elf_Addr cursor = eh_frame_vaddr;
+                    while (si.max_load - cursor >= 4) {
+                        uint32_t len32;
+                        memcpy(&len32, base + cursor, 4);
+                        Elf_Addr body = cursor + 4;
+                        if (len32 == 0) {
+                            cursor = body;      // terminator; section ends here
+                            break;
+                        }
+                        uint64_t len = len32;
+                        if (len32 == 0xffffffff) {
+                            if (si.max_load - body < 8) break;
+                            memcpy(&len, base + body, 8);
+                            body += 8;
+                        }
+                        if (len > si.max_load - body) break;  // runs past image
+                        cursor = body + len;
                     }
-                    Elf_Addr max_fde_vaddr =
-                        eh_phdr->p_vaddr + (int64_t)max_fde_off;
-
-                    // Bounds-check max_fde_vaddr before dereferencing.
-                    // Untrusted: dump bytes can be partially corrupted (yidun
-                    // anti-tamper rewrites RX pages on detection), and the
-                    // table walk above scans whatever fde_count says is there.
-                    // Need room for the largest read we'll do: 12 bytes
-                    // (length=0xffffffff sentinel + 8-byte extended length).
-                    if (max_fde_vaddr >= si.min_load &&
-                        max_fde_vaddr + 12 <= si.max_load)
-                    {
-                        uint32_t fde_len32;
-                        memcpy(&fde_len32, base + max_fde_vaddr, 4);
-                        Elf_Addr fde_end;
-                        if (fde_len32 == 0xffffffff) {
-                            uint64_t fde_len64;
-                            memcpy(&fde_len64, base + max_fde_vaddr + 4, 8);
-                            fde_end = max_fde_vaddr + 12 + fde_len64;
-                        } else {
-                            fde_end = max_fde_vaddr + 4 + fde_len32;
-                        }
-                        if (fde_end > eh_frame_vaddr &&
-                            fde_end <= si.max_load)
-                        {
-                            eh_frame_size = fde_end - eh_frame_vaddr;
-                            size_known = true;
-                        }
+                    if (cursor > eh_frame_vaddr) {
+                        eh_frame_size = cursor - eh_frame_vaddr;
+                        size_known = true;
                     }
                 }
 

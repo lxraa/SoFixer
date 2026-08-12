@@ -1,11 +1,13 @@
 # SoFixer
 用于修复从内存中 dump 下来的So文件。
 ## Build
+`-DSO_64` 是编译期切换整套 `Elf_*` 类型的开关，32/64 位是两份不同的 cmake 配置，
+**必须各用各的 build 目录**——共用一个的话，最后一次 `cmake` 跑的是哪个，你就只能修哪个，
+另一个 arch 会静默沿用目录里那个过期的二进制。
+
 ```shell
-mkdir build
-# 参数 -DSO_64=ON 用于修复64位so文件，不添加则为修复32位so文件
-cmake -DSO_64=ON ..
-make
+mkdir build   && cd build   && cmake -DSO_64=ON  .. && make   # 修 64 位 so
+cd .. && mkdir build32 && cd build32 && cmake -DSO_64=OFF .. && make   # 修 32 位 so
 ```
 
 ## 测试
